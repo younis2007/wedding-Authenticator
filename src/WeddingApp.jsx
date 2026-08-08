@@ -524,7 +524,7 @@ const initialGuests = [
     checkedIn: false,
     isExtraCard: true,
     issued: false,
-    phonePolicy: null,
+    phonePolicy: "pouch",
   })),
 ];
 
