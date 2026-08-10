@@ -2697,16 +2697,16 @@ function CameraScannerModal({ guests, onClose, onResult }) {
         </div>
       )}
 
-      {state === "active" && (
-        <div className="flex-1 relative overflow-hidden">
-          <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <div className="w-64 h-64 rounded-2xl" style={{ border: `3px solid ${COLORS.gold}` }} />
-          </div>
+      {/* A single persistent <video> element, kept mounted across every state so the
+          stream (attached imperatively via srcObject) is never dropped — conditionally
+          rendering separate <video> elements per state would make React swap in a fresh,
+          source-less DOM node on each transition, leaving the visible one permanently black. */}
+      <div className={`flex-1 relative overflow-hidden ${state === "active" ? "" : "hidden"}`}>
+        <video ref={videoRef} className="w-full h-full object-cover" playsInline muted autoPlay />
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div className="w-64 h-64 rounded-2xl" style={{ border: `3px solid ${COLORS.gold}` }} />
         </div>
-      )}
-      {/* the video element must exist for the requesting phase too so getUserMedia can attach on time */}
-      {state === "requesting" && <video ref={videoRef} className="hidden" playsInline muted />}
+      </div>
 
       {state === "error" && (
         <div className="flex-1 flex flex-col items-center justify-center gap-3 text-white px-6 text-center">
