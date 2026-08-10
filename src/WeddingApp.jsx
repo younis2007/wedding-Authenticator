@@ -2960,12 +2960,23 @@ function printAllCards(cards, onIssued) {
       })
       .join("");
     printWindow.document.body.innerHTML = html;
-    printWindow.addEventListener("afterprint", () => {
-      printWindow.close();
-      onIssued();
+
+    // The <img> elements exist in the DOM immediately, but decoding ~100 base64
+    // images isn't synchronous — calling print() right away can capture them
+    // before the browser has actually rendered any pixels, producing a blank
+    // page. Wait for every image to finish loading first.
+    const imgs = Array.from(printWindow.document.images);
+    Promise.all(
+      imgs.map((img) => (img.complete ? Promise.resolve() : new Promise((resolve) => (img.onload = img.onerror = resolve))))
+    ).then(() => {
+      if (printWindow.closed) return;
+      printWindow.addEventListener("afterprint", () => {
+        printWindow.close();
+        onIssued();
+      });
+      printWindow.focus();
+      printWindow.print();
     });
-    printWindow.focus();
-    printWindow.print();
   }, 60);
 }
 
