@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { supabase } from "./supabaseClient";
 import {
   Phone,
   Calendar,
@@ -3238,13 +3239,140 @@ function AdminDashboard({ guests, setGuests, messages, onExit }) {
   );
 }
 
+/* ---------- Supabase-backed shared state ---------------------------------
+ * Every device/browser previously kept its own isolated copy of guests and
+ * messages in local React state — nothing was shared. This hook keeps the
+ * exact same [items, setItems] shape existing call sites already use
+ * (setItems(prev => ...) works unchanged), but mirrors every change to
+ * Supabase and subscribes to realtime updates so all open browsers converge
+ * on the same data. When Supabase isn't configured (no env vars), it quietly
+ * falls back to plain local state so the app still works standalone.
+ * ------------------------------------------------------------------------- */
+function useSupabaseSyncedList(table, initialSeed, mapToRow, mapFromRow) {
+  const [items, setItems] = useState(initialSeed);
+
+  useEffect(() => {
+    if (!supabase) return;
+    let cancelled = false;
+
+    (async () => {
+      const { data, error } = await supabase.from(table).select("*").order("id", { ascending: true });
+      if (cancelled) return;
+      if (error) {
+        console.error(`[supabase] failed to load ${table}:`, error.message);
+        return;
+      }
+      if (data.length === 0 && initialSeed.length > 0) {
+        const { error: seedError } = await supabase.from(table).insert(initialSeed.map(mapToRow));
+        if (cancelled) return;
+        if (seedError) console.error(`[supabase] failed to seed ${table}:`, seedError.message);
+        // keep local initialSeed as-is; it now matches what's in the DB
+      } else {
+        setItems(data.map(mapFromRow));
+      }
+    })();
+
+    const channel = supabase
+      .channel(`${table}-changes`)
+      .on("postgres_changes", { event: "*", schema: "public", table }, (payload) => {
+        setItems((prev) => {
+          if (payload.eventType === "DELETE") {
+            return prev.filter((it) => it.id !== payload.old.id);
+          }
+          const incoming = mapFromRow(payload.new);
+          const idx = prev.findIndex((it) => it.id === incoming.id);
+          if (idx === -1) return [...prev, incoming];
+          const next = prev.slice();
+          next[idx] = incoming;
+          return next;
+        });
+      })
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase.removeChannel(channel);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function setItemsSynced(updater) {
+    setItems((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      if (supabase) {
+        const nextIds = new Set(next.map((it) => it.id));
+        const toDelete = prev.filter((it) => !nextIds.has(it.id));
+        const toUpsert = next.filter((it) => {
+          const old = prev.find((p) => p.id === it.id);
+          return !old || JSON.stringify(old) !== JSON.stringify(it);
+        });
+        if (toUpsert.length) {
+          supabase
+            .from(table)
+            .upsert(toUpsert.map(mapToRow))
+            .then(({ error }) => error && console.error(`[supabase] upsert ${table} failed:`, error.message));
+        }
+        if (toDelete.length) {
+          supabase
+            .from(table)
+            .delete()
+            .in("id", toDelete.map((it) => it.id))
+            .then(({ error }) => error && console.error(`[supabase] delete ${table} failed:`, error.message));
+        }
+      }
+      return next;
+    });
+  }
+
+  return [items, setItemsSynced];
+}
+function guestToRow(g) {
+  return {
+    id: g.id,
+    name: g.name || "",
+    phone: g.phone || "",
+    pass_code: g.passCode,
+    companions: g.companions || 0,
+    children: g.children || 0,
+    status: g.status || "pending",
+    checked_in: !!g.checkedIn,
+    is_extra_card: !!g.isExtraCard,
+    issued: !!g.issued,
+    phone_policy: g.phonePolicy || "pouch",
+  };
+}
+function guestFromRow(r) {
+  const g = {
+    id: r.id,
+    name: r.name,
+    phone: r.phone,
+    passCode: r.pass_code,
+    companions: r.companions,
+    children: r.children,
+    status: r.status,
+    checkedIn: r.checked_in,
+    phonePolicy: r.phone_policy,
+  };
+  if (r.is_extra_card) {
+    g.isExtraCard = true;
+    g.issued = r.issued;
+  }
+  return g;
+}
+function messageToRow(m) {
+  return { id: m.id, guest_name: m.guestName, date: m.date, text: m.text };
+}
+function messageFromRow(r) {
+  return { id: r.id, guestName: r.guest_name, date: r.date, text: r.text };
+}
+
 /* ---------- root ---------- */
 
 export default function WeddingApp() {
   const [screen, setScreen] = useState("landing"); // landing|phone|notfound|rsvp|pass|declined
   const [currentGuestId, setCurrentGuestId] = useState(null);
-  const [guests, setGuests] = useState(initialGuests);
-  const [messages, setMessages] = useState(initialMessages);
+  const [guests, setGuests] = useSupabaseSyncedList("guests", initialGuests, guestToRow, guestFromRow);
+  const [messages, setMessages] = useSupabaseSyncedList("messages", initialMessages, messageToRow, messageFromRow);
   const [thankYouOpen, setThankYouOpen] = useState(false);
   const [adminUnlocked, setAdminUnlocked] = useState(false);
   const [scanUnlocked, setScanUnlocked] = useState(false);
