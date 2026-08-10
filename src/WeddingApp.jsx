@@ -1720,8 +1720,8 @@ function DeclinedScreen({ onBackToInvite }) {
 }
 
 // Standard business-card size at 300 DPI (3.5in x 2in).
-const BUSINESS_CARD_W = 1050;
-const BUSINESS_CARD_H = 600;
+const BUSINESS_CARD_W = 1500; // 5in @ 300dpi — standard 3x5 index card, landscape
+const BUSINESS_CARD_H = 900; // 3in @ 300dpi
 
 function roundedRectPath(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -1740,70 +1740,76 @@ function roundedRectPath(ctx, x, y, w, h, r) {
 function drawExtraCardToCanvas(canvas, guest, cardNumber) {
   const W = BUSINESS_CARD_W;
   const H = BUSINESS_CARD_H;
+  // Layout below was designed against a 1050x600 reference; sx/sy convert every
+  // hardcoded position to the actual canvas size, and `s` (the smaller of the two)
+  // scales square/symmetric elements (QR, radii, fonts) so nothing overflows.
+  const sx = W / 1050;
+  const sy = H / 600;
+  const s = Math.min(sx, sy);
   canvas.width = W;
   canvas.height = H;
   const ctx = canvas.getContext("2d");
   const ivory = "#F7F0E6";
   const brown = "#5C4632";
-  const inset = 10;
+  const inset = 10 * s;
 
   ctx.fillStyle = "#000000";
   ctx.fillRect(0, 0, W, H);
 
-  roundedRectPath(ctx, inset, inset, W - inset * 2, H - inset * 2, 18);
+  roundedRectPath(ctx, inset, inset, W - inset * 2, H - inset * 2, 18 * s);
   ctx.fillStyle = ivory;
   ctx.fill();
 
   ctx.save();
-  roundedRectPath(ctx, inset, inset, W - inset * 2, H - inset * 2, 18);
+  roundedRectPath(ctx, inset, inset, W - inset * 2, H - inset * 2, 18 * s);
   ctx.clip();
   ctx.strokeStyle = "#EAE0D2";
-  ctx.lineWidth = 1;
-  for (let y = 20; y < H; y += 58) {
-    for (let x = 20; x < W; x += 58) {
+  ctx.lineWidth = 1 * s;
+  for (let y = 20 * sy; y < H; y += 58 * sy) {
+    for (let x = 20 * sx; x < W; x += 58 * sx) {
       ctx.beginPath();
-      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.arc(x, y, 3 * s, 0, Math.PI * 2);
       ctx.stroke();
     }
   }
   ctx.restore();
 
   ctx.strokeStyle = "#D8C9B0";
-  ctx.lineWidth = 2;
-  ctx.strokeRect(30, 30, W - 60, H - 60);
-  ctx.strokeRect(38, 38, W - 76, H - 76);
+  ctx.lineWidth = 2 * s;
+  ctx.strokeRect(30 * sx, 30 * sy, W - 60 * sx, H - 60 * sy);
+  ctx.strokeRect(38 * sx, 38 * sy, W - 76 * sx, H - 76 * sy);
 
-  const dividerX = 810;
-  const columnTop = 40;
-  const columnBottom = H - 40;
+  const dividerX = 810 * sx;
+  const columnTop = 40 * sy;
+  const columnBottom = H - 40 * sy;
   ctx.strokeStyle = COLORS.orange;
-  ctx.lineWidth = 2;
+  ctx.lineWidth = 2 * s;
   ctx.beginPath();
   ctx.moveTo(dividerX, columnTop);
   ctx.lineTo(dividerX, columnBottom);
   ctx.stroke();
 
-  const qrCenterX = dividerX + (W - dividerX) / 2 - 18;
-  const qrSize = 165;
-  const labelH = 30;
-  const gap = 22;
-  const codeH = 30;
-  const blockHeight = labelH + gap + (qrSize + 16) + gap + codeH;
+  const qrCenterX = dividerX + (W - dividerX) / 2 - 18 * sx;
+  const qrSize = 165 * s;
+  const labelH = 30 * s;
+  const gap = 22 * s;
+  const codeH = 30 * s;
+  const blockHeight = labelH + gap + (qrSize + 16 * s) + gap + codeH;
   const blockTop = columnTop + (columnBottom - columnTop - blockHeight) / 2;
 
   ctx.textAlign = "center";
   ctx.fillStyle = brown;
-  ctx.font = "bold 22px Tajawal, Arial";
-  ctx.fillText("رمز الكود", qrCenterX, blockTop + labelH - 6);
+  ctx.font = `bold ${22 * s}px Tajawal, Arial`;
+  ctx.fillText("رمز الكود", qrCenterX, blockTop + labelH - 6 * s);
 
   const qrBoxTop = blockTop + labelH + gap;
   const qrX = qrCenterX - qrSize / 2;
-  const qrY = qrBoxTop + 8;
+  const qrY = qrBoxTop + 8 * s;
   ctx.fillStyle = "#FFFFFF";
-  ctx.fillRect(qrX - 8, qrBoxTop, qrSize + 16, qrSize + 16);
+  ctx.fillRect(qrX - 8 * s, qrBoxTop, qrSize + 16 * s, qrSize + 16 * s);
   ctx.strokeStyle = COLORS.orange;
-  ctx.lineWidth = 3;
-  ctx.strokeRect(qrX - 8, qrBoxTop, qrSize + 16, qrSize + 16);
+  ctx.lineWidth = 3 * s;
+  ctx.strokeRect(qrX - 8 * s, qrBoxTop, qrSize + 16 * s, qrSize + 16 * s);
 
   const payload = `hala-event://verify?pass=${guest.passCode}&phone=${normalizeSaudiPhone(guest.phone)}`;
   const { matrix, size: modules } = encodeQR(payload);
@@ -1816,45 +1822,45 @@ function drawExtraCardToCanvas(canvas, guest, cardNumber) {
   }
 
   ctx.fillStyle = COLORS.orange;
-  ctx.font = "bold 26px Tajawal, Arial";
-  ctx.fillText(guest.passCode, qrCenterX, qrBoxTop + (qrSize + 16) + gap + codeH - 6);
+  ctx.font = `bold ${26 * s}px Tajawal, Arial`;
+  ctx.fillText(guest.passCode, qrCenterX, qrBoxTop + (qrSize + 16 * s) + gap + codeH - 6 * s);
 
-  const rightEdge = 780;
+  const rightEdge = 780 * sx;
   ctx.textAlign = "right";
   ctx.fillStyle = COLORS.orange;
-  ctx.font = "bold 30px Tajawal, Arial";
-  ctx.fillText(`${EVENT.dayName} ${EVENT.dateLabel}  ·  ${EVENT.venue}`, rightEdge, 75);
+  ctx.font = `bold ${30 * s}px Tajawal, Arial`;
+  ctx.fillText(`${EVENT.dayName} ${EVENT.dateLabel}  ·  ${EVENT.venue}`, rightEdge, 75 * sy);
 
-  const leftCenterX = (60 + rightEdge) / 2;
+  const leftCenterX = (60 * sx + rightEdge) / 2;
   ctx.textAlign = "center";
   ctx.fillStyle = brown;
-  ctx.font = "20px Tajawal, Arial";
-  ctx.fillText("اسم الضيف", leftCenterX, 165);
+  ctx.font = `${20 * s}px Tajawal, Arial`;
+  ctx.fillText("اسم الضيف", leftCenterX, 165 * sy);
 
   ctx.fillStyle = COLORS.textDark;
-  ctx.font = guest.name ? "bold 40px Tajawal, Arial" : "bold 56px Tajawal, Arial";
-  ctx.fillText(guest.name || "—", leftCenterX, 235);
+  ctx.font = guest.name ? `bold ${40 * s}px Tajawal, Arial` : `bold ${56 * s}px Tajawal, Arial`;
+  ctx.fillText(guest.name || "—", leftCenterX, 235 * sy);
 
   ctx.fillStyle = brown;
-  ctx.font = "20px Tajawal, Arial";
+  ctx.font = `${20 * s}px Tajawal, Arial`;
   const infoLine = `الجوال: ${formatDisplayPhone(guest.phone) || "—"}   ·   بالغين: ${guest.companions}   ·   أطفال: ${guest.children}`;
-  ctx.fillText(infoLine, leftCenterX, 300);
+  ctx.fillText(infoLine, leftCenterX, 300 * sy);
 
   ctx.strokeStyle = COLORS.orange;
-  ctx.lineWidth = 1.5;
+  ctx.lineWidth = 1.5 * s;
   ctx.beginPath();
-  ctx.moveTo(60, 335);
-  ctx.lineTo(rightEdge, 335);
+  ctx.moveTo(60 * sx, 335 * sy);
+  ctx.lineTo(rightEdge, 335 * sy);
   ctx.stroke();
 
   ctx.textAlign = "center";
   ctx.fillStyle = brown;
-  ctx.font = "20px Tajawal, Arial";
-  ctx.fillText("رقم الكرت", leftCenterX, 395);
+  ctx.font = `${20 * s}px Tajawal, Arial`;
+  ctx.fillText("رقم الكرت", leftCenterX, 395 * sy);
 
   ctx.fillStyle = COLORS.orange;
-  ctx.font = "bold 150px Tajawal, Arial";
-  ctx.fillText(String(cardNumber), leftCenterX, 545);
+  ctx.font = `bold ${150 * s}px Tajawal, Arial`;
+  ctx.fillText(String(cardNumber), leftCenterX, 545 * sy);
 
   return canvas;
 }
@@ -2921,79 +2927,51 @@ function MessagesTab({ messages }) {
   );
 }
 
-function PrintAllCardsOverlay({ cards, onDone }) {
-  const [images, setImages] = useState(null);
+// Prints cards through a dedicated, isolated print window instead of hiding the rest
+// of the admin page via CSS — the previous visibility-hack approach was fragile
+// against the host page's own styles/stacking context and could end up printing the
+// dashboard behind it. window.open() is called synchronously (before any async work)
+// so popup blockers treat it as the direct result of the user's click.
+function printAllCards(cards, onIssued) {
+  const printWindow = window.open("", "_blank");
+  if (!printWindow) {
+    window.alert("الرجاء السماح بالنوافذ المنبثقة (popups) لهذا الموقع حتى تقدر تطبع الكروت");
+    return;
+  }
+  printWindow.document.write(`<!DOCTYPE html>
+<html dir="rtl" lang="ar"><head><meta charset="utf-8" /><title>طباعة الكروت</title>
+<style>
+  @page { size: 5in 3in; margin: 0; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { display: flex; flex-wrap: wrap; background: #fff; font-family: Tajawal, Arial, sans-serif; }
+  img { width: 5in; height: 3in; display: block; page-break-inside: avoid; break-inside: avoid; }
+  #loading { padding: 40px; color: #333; }
+</style></head>
+<body><p id="loading">جاري تجهيز ${cards.length} كرت للطباعة...</p></body></html>`);
+  printWindow.document.close();
 
-  useEffect(() => {
+  setTimeout(() => {
+    if (printWindow.closed) return;
     const canvas = document.createElement("canvas");
-    const rendered = cards.map((g, i) => {
-      drawExtraCardToCanvas(canvas, g, i + 1);
-      return canvas.toDataURL("image/png");
+    const html = cards
+      .map((g, i) => {
+        drawExtraCardToCanvas(canvas, g, i + 1);
+        return `<img src="${canvas.toDataURL("image/png")}" />`;
+      })
+      .join("");
+    printWindow.document.body.innerHTML = html;
+    printWindow.addEventListener("afterprint", () => {
+      printWindow.close();
+      onIssued();
     });
-    setImages(rendered);
-  }, [cards]);
-
-  useEffect(() => {
-    if (!images) return;
-    function handleAfterPrint() {
-      onDone();
-    }
-    window.addEventListener("afterprint", handleAfterPrint);
-    const t = setTimeout(() => window.print(), 250);
-    return () => {
-      clearTimeout(t);
-      window.removeEventListener("afterprint", handleAfterPrint);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [images]);
-
-  return (
-    <div className="fixed inset-0 z-[70] bg-black/60 flex flex-col">
-      <style>{`
-        @media print {
-          @page { margin: 0.2in; }
-          body * { visibility: hidden; }
-          #print-all-cards, #print-all-cards * { visibility: visible; }
-          #print-all-cards {
-            position: fixed;
-            inset: 0;
-            display: flex !important;
-            flex-wrap: wrap;
-            gap: 0.15in;
-            background: #fff !important;
-          }
-          #print-all-cards img {
-            width: 3.5in;
-            height: 2in;
-            break-inside: avoid;
-            page-break-inside: avoid;
-            display: block;
-          }
-        }
-      `}</style>
-      <div className="m-auto rounded-2xl p-6 text-center" style={{ backgroundColor: COLORS.card, maxWidth: 320 }}>
-        <Printer size={40} className="mx-auto" color={COLORS.oliveDark} />
-        <p className="font-bold mt-3" style={{ color: COLORS.textDark }}>
-          {images ? "جاري فتح نافذة الطباعة..." : `جاري تجهيز ${cards.length} كرت...`}
-        </p>
-        <p className="text-xs mt-2" style={{ color: COLORS.mutedText }}>
-          سيتم طباعة كل الكروت بحجم كرت البزنس (3.5 × 2 إنش) بأمر طباعة واحد
-        </p>
-        <div className="mt-5">
-          <SecondaryButton onClick={onDone}>إلغاء</SecondaryButton>
-        </div>
-      </div>
-      <div id="print-all-cards" className="hidden">
-        {images && images.map((src, i) => <img key={i} src={src} alt={`card-${i + 1}`} />)}
-      </div>
-    </div>
-  );
+    printWindow.focus();
+    printWindow.print();
+  }, 60);
 }
 
 function ExtraCardsTab({ guests, setGuests }) {
   const extraCards = guests.filter((g) => g.isExtraCard);
   const [previewUrl, setPreviewUrl] = useState(null);
-  const [printAllOpen, setPrintAllOpen] = useState(false);
   const assignedCount = extraCards.filter((g) => g.name.trim()).length;
 
   function updateCard(id, patch) {
@@ -3007,9 +2985,10 @@ function ExtraCardsTab({ guests, setGuests }) {
     updateCard(guest.id, { issued: true });
   }
 
-  function handlePrintAllDone() {
-    setPrintAllOpen(false);
-    setGuests((prev) => prev.map((g) => (g.isExtraCard ? { ...g, issued: true } : g)));
+  function handlePrintAll() {
+    printAllCards(extraCards, () => {
+      setGuests((prev) => prev.map((g) => (g.isExtraCard ? { ...g, issued: true } : g)));
+    });
   }
 
   const issuedCount = extraCards.filter((g) => g.issued).length;
@@ -3017,12 +2996,12 @@ function ExtraCardsTab({ guests, setGuests }) {
   return (
     <div>
       <button
-        onClick={() => setPrintAllOpen(true)}
+        onClick={handlePrintAll}
         className="w-full rounded-2xl py-3.5 mb-4 flex items-center justify-center gap-2 font-bold text-white"
         style={{ backgroundColor: COLORS.oliveDark }}
       >
         <Printer size={18} />
-        طباعة جميع الكروت ({extraCards.length}) بحجم كرت البزنس
+        طباعة جميع الكروت ({extraCards.length}) بحجم كرت 3×5
       </button>
 
       <div className="rounded-2xl p-4 mb-4 text-sm leading-6" style={{ backgroundColor: COLORS.card, color: COLORS.mutedText }}>
@@ -3181,7 +3160,6 @@ function ExtraCardsTab({ guests, setGuests }) {
       </div>
 
       {previewUrl && <ImagePreviewModal dataUrl={previewUrl} onClose={() => setPreviewUrl(null)} />}
-      {printAllOpen && <PrintAllCardsOverlay cards={extraCards} onDone={handlePrintAllDone} />}
     </div>
   );
 }
