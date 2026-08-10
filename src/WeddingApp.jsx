@@ -399,6 +399,739 @@ function encodeQR(text) {
   return { size, matrix: bestMatrix };
 }
 
+/* =========================================================================
+ * QR Code decoder — cross-browser fallback for camera scanning. The native
+ * BarcodeDetector API used by CameraScannerModal is unsupported in Safari/iPhone
+ * and many Chromium builds, so this pure-JS decoder runs against captured video
+ * frames when BarcodeDetector isn't available. Handles rotation, blur, noise, and
+ * real perspective/keystone tilt (common when a phone isn't held perfectly square
+ * to a printed pass). Reuses the GF(256) math, VERSION_INFO_L, sizeForVersion,
+ * makeBoolMatrix, and MASK_FUNCS already defined above for the encoder.
+ * ========================================================================= */
+function gfDiv(a, b) {
+  if (a === 0) return 0;
+  return GF_EXP[(GF_LOG[a] - GF_LOG[b] + 255) % 255];
+}
+function gfPow(a, n) {
+  return GF_EXP[(GF_LOG[a] * n) % 255 < 0 ? ((GF_LOG[a] * n) % 255) + 255 : (GF_LOG[a] * n) % 255];
+}
+function gfInv(a) {
+  return GF_EXP[255 - GF_LOG[a]];
+}
+function markFinderPattern(isFunc, row, col, size) {
+  for (let dr = -1; dr <= 7; dr++) {
+    for (let dc = -1; dc <= 7; dc++) {
+      const r = row + dr,
+        c = col + dc;
+      if (r < 0 || r >= size || c < 0 || c >= size) continue;
+      isFunc[r][c] = true;
+    }
+  }
+}
+function markTimingPatterns(isFunc, size) {
+  for (let i = 8; i < size - 8; i++) {
+    isFunc[6][i] = true;
+    isFunc[i][6] = true;
+  }
+}
+function markAlignmentPattern(isFunc, size, version) {
+  if (version === 1) return;
+  const pos = size - 7;
+  for (let dr = -2; dr <= 2; dr++) {
+    for (let dc = -2; dc <= 2; dc++) {
+      isFunc[pos + dr][pos + dc] = true;
+    }
+  }
+}
+function markFormatAreas(isFunc, size) {
+  for (let i = 0; i <= 8; i++) {
+    isFunc[8][i] = true;
+    isFunc[i][8] = true;
+  }
+  for (let i = 0; i < 8; i++) {
+    isFunc[8][size - 1 - i] = true;
+    isFunc[size - 1 - i][8] = true;
+  }
+}
+function buildFunctionMask(size, version) {
+  const isFunc = makeBoolMatrix(size, false);
+  markFinderPattern(isFunc, 0, 0, size);
+  markFinderPattern(isFunc, 0, size - 7, size);
+  markFinderPattern(isFunc, size - 7, 0, size);
+  markTimingPatterns(isFunc, size);
+  markAlignmentPattern(isFunc, size, version);
+  markFormatAreas(isFunc, size);
+  isFunc[4 * version + 9][8] = true;
+  return isFunc;
+}
+// Full 5-bit (ecLevel<<3 | mask) format-bits computation, for building the 32-entry
+// nearest-match table below — distinct from the encoder's computeFormatBits(maskIndex),
+// which only ever encodes level L.
+function computeFormatBitsForData5(data5) {
+  let d = data5 << 10;
+  for (let i = 14; i >= 10; i--) {
+    if ((d >>> i) & 1) d ^= FORMAT_GEN << (i - 10);
+  }
+  const bits = (data5 << 10) | d;
+  return bits ^ 0x5412;
+}
+const FORMAT_TABLE = [];
+for (let d = 0; d < 32; d++) FORMAT_TABLE.push(computeFormatBitsForData5(d));
+function popcount(x) {
+  let c = 0;
+  while (x) {
+    c += x & 1;
+    x >>>= 1;
+  }
+  return c;
+}
+function decodeFormatBits(bits15) {
+  let best = -1,
+    bestDist = 99;
+  for (let d = 0; d < 32; d++) {
+    const dist = popcount(bits15 ^ FORMAT_TABLE[d]);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = d;
+    }
+  }
+  if (bestDist > 3) return null;
+  return { ecLevel: (best >> 3) & 0b11, mask: best & 0b111, distance: bestDist };
+}
+function readFormatCopyA(matrix, size) {
+  let bits = 0;
+  for (let i = 0; i < 15; i++) {
+    let v;
+    if (i < 6) v = matrix[i][8];
+    else if (i < 8) v = matrix[i + 1][8];
+    else v = matrix[size - 15 + i][8];
+    if (v) bits |= 1 << i;
+  }
+  return bits;
+}
+function readFormatCopyB(matrix, size) {
+  let bits = 0;
+  for (let i = 0; i < 15; i++) {
+    let v;
+    if (i < 8) v = matrix[8][size - i - 1];
+    else if (i < 9) v = matrix[8][15 - i - 1 + 1];
+    else v = matrix[8][15 - i - 1];
+    if (v) bits |= 1 << i;
+  }
+  return bits;
+}
+function readDataBits(matrix, isFunc, size) {
+  const bits = [];
+  let upward = true;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < size; vert++) {
+      for (let j = 0; j < 2; j++) {
+        const x = right - j;
+        const y = upward ? size - 1 - vert : vert;
+        if (!isFunc[y][x]) bits.push(matrix[y][x] ? 1 : 0);
+      }
+    }
+    upward = !upward;
+  }
+  return bits;
+}
+
+// ---------- Reed-Solomon error correction decoding ----------
+// Ascending-power arrays throughout (index i = coefficient of x^i) to avoid
+// convention-mixing bugs. codewords[0] is the most-significant symbol (coefficient
+// of x^(n-1)), matching QR's placement order.
+function xorPoly(a, b) {
+  const len = Math.max(a.length, b.length);
+  const out = new Array(len).fill(0);
+  for (let i = 0; i < a.length; i++) out[i] ^= a[i];
+  for (let i = 0; i < b.length; i++) out[i] ^= b[i];
+  return out;
+}
+function rsDecode(codewords, ecCount) {
+  const n = codewords.length;
+  const c = codewords.slice();
+  const S = new Array(ecCount).fill(0);
+  let hasError = false;
+  for (let i = 0; i < ecCount; i++) {
+    let s = 0;
+    const alphaI = GF_EXP[i];
+    for (let j = 0; j < n; j++) {
+      s ^= gfMul(c[j], gfPow(alphaI, n - 1 - j));
+    }
+    S[i] = s;
+    if (s !== 0) hasError = true;
+  }
+  if (!hasError) return { codewords: c, errors: 0 };
+
+  // Berlekamp-Massey (GF(2^m), so subtraction == addition == XOR).
+  let C = [1];
+  let B = [1];
+  let L = 0;
+  let m = 1;
+  let b = 1;
+  for (let nIdx = 0; nIdx < ecCount; nIdx++) {
+    let delta = S[nIdx];
+    for (let i = 1; i <= L; i++) {
+      if (i < C.length) delta ^= gfMul(C[i], S[nIdx - i]);
+    }
+    if (delta === 0) {
+      m += 1;
+    } else {
+      const coef = gfDiv(delta, b);
+      const shiftedB = new Array(m).fill(0).concat(B.map((v) => gfMul(v, coef)));
+      const newC = xorPoly(C, shiftedB);
+      if (2 * L <= nIdx) {
+        B = C;
+        L = nIdx + 1 - L;
+        b = delta;
+        m = 1;
+      } else {
+        m += 1;
+      }
+      C = newC;
+    }
+  }
+  const lambda = C;
+  const errCount = L;
+  if (errCount <= 0 || errCount > ecCount / 2) return null;
+
+  // Chien search: root x = alpha^-i of Lambda(x) means an error at array position n-1-i.
+  const errPositions = [];
+  for (let i = 0; i < n; i++) {
+    const x = gfInv(GF_EXP[i % 255]);
+    let y = 0;
+    for (let k = 0; k < lambda.length; k++) y ^= gfMul(lambda[k], gfPow(x, k));
+    if (y === 0) {
+      const pos = n - 1 - i;
+      if (pos >= 0 && pos < n) errPositions.push(pos);
+    }
+  }
+  if (errPositions.length !== errCount) return null;
+
+  // Forney: error evaluator Omega(x) = S(x)*Lambda(x) mod x^ecCount.
+  const omega = new Array(ecCount).fill(0);
+  for (let i = 0; i < ecCount; i++) {
+    let sum = 0;
+    for (let k = 0; k <= i; k++) {
+      if (k < lambda.length) sum ^= gfMul(S[i - k], lambda[k]);
+    }
+    omega[i] = sum;
+  }
+  const lambdaPrime = new Array(Math.max(0, lambda.length - 1)).fill(0);
+  for (let k = 1; k < lambda.length; k += 2) lambdaPrime[k - 1] = lambda[k];
+
+  for (const pos of errPositions) {
+    const i = n - 1 - pos;
+    const xInv = GF_EXP[(255 - (i % 255)) % 255];
+    let omegaVal = 0;
+    for (let k = 0; k < omega.length; k++) omegaVal ^= gfMul(omega[k], gfPow(xInv, k));
+    let lambdaPrimeVal = 0;
+    for (let k = 0; k < lambdaPrime.length; k++) lambdaPrimeVal ^= gfMul(lambdaPrime[k], gfPow(xInv, k));
+    if (lambdaPrimeVal === 0) return null;
+    const xVal = GF_EXP[i % 255];
+    const magnitude = gfMul(xVal, gfDiv(omegaVal, lambdaPrimeVal));
+    c[pos] ^= magnitude;
+  }
+
+  for (let i = 0; i < ecCount; i++) {
+    let s = 0;
+    const alphaI = GF_EXP[i];
+    for (let j = 0; j < n; j++) s ^= gfMul(c[j], gfPow(alphaI, n - 1 - j));
+    if (s !== 0) return null;
+  }
+  return { codewords: c, errors: errCount };
+}
+
+// ---------- image processing: grayscale, binarize ----------
+function toGrayscale(data, width, height) {
+  const gray = new Uint8ClampedArray(width * height);
+  for (let i = 0; i < width * height; i++) {
+    gray[i] = (data[i * 4] * 0.299 + data[i * 4 + 1] * 0.587 + data[i * 4 + 2] * 0.114) | 0;
+  }
+  return gray;
+}
+function otsuThreshold(gray) {
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+  const total = gray.length;
+  let sum = 0;
+  for (let t = 0; t < 256; t++) sum += t * hist[t];
+  let sumB = 0,
+    wB = 0,
+    varMax = 0,
+    threshold = 127;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF === 0) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const varBetween = wB * wF * (mB - mF) * (mB - mF);
+    if (varBetween > varMax) {
+      varMax = varBetween;
+      threshold = t;
+    }
+  }
+  return threshold;
+}
+// Block-based adaptive threshold for uneven lighting.
+function binarizeAdaptive(gray, width, height, blockSize) {
+  const bin = new Uint8Array(width * height);
+  const bw = Math.ceil(width / blockSize);
+  const bh = Math.ceil(height / blockSize);
+  const blockThresh = new Float32Array(bw * bh);
+  for (let by = 0; by < bh; by++) {
+    for (let bx = 0; bx < bw; bx++) {
+      let min = 255,
+        max = 0;
+      const x0 = bx * blockSize,
+        y0 = by * blockSize;
+      const x1 = Math.min(x0 + blockSize, width),
+        y1 = Math.min(y0 + blockSize, height);
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const v = gray[y * width + x];
+          if (v < min) min = v;
+          if (v > max) max = v;
+        }
+      }
+      blockThresh[by * bw + bx] = max - min > 24 ? (min + max) / 2 : -1; // -1 = flat block, resolve later
+    }
+  }
+  const globalT = otsuThreshold(gray);
+  for (let i = 0; i < blockThresh.length; i++) if (blockThresh[i] < 0) blockThresh[i] = globalT;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const bx = Math.min(bw - 1, Math.floor(x / blockSize));
+      const by = Math.min(bh - 1, Math.floor(y / blockSize));
+      const t = blockThresh[by * bw + bx];
+      bin[y * width + x] = gray[y * width + x] <= t ? 1 : 0;
+    }
+  }
+  return bin;
+}
+
+// ---------- finder pattern detection ----------
+function checkRatio(runs) {
+  // runs: 5 consecutive run lengths, expect ratio 1:1:3:1:1
+  const total = runs.reduce((a, b) => a + b, 0);
+  if (total < 7) return false;
+  const unit = total / 7;
+  const tolerance = unit * 0.6;
+  const expect = [1, 1, 3, 1, 1];
+  for (let i = 0; i < 5; i++) {
+    if (Math.abs(runs[i] - expect[i] * unit) > tolerance) return false;
+  }
+  return true;
+}
+function runLengthEncode(getColor, length) {
+  const segs = [];
+  let color = getColor(0);
+  let start = 0;
+  for (let i = 1; i <= length; i++) {
+    const c = i < length ? getColor(i) : -1;
+    if (c !== color) {
+      segs.push({ color, start, len: i - start });
+      color = c;
+      start = i;
+    }
+  }
+  return segs;
+}
+function findFinderCandidatesInRow(bin, width, y, offset) {
+  const candidates = [];
+  const segs = runLengthEncode((x) => bin[offset + x], width);
+  for (let i = 0; i + 4 < segs.length; i++) {
+    if (segs[i].color !== 1) continue; // window must start on a dark run
+    const window = segs.slice(i, i + 5);
+    const runs = window.map((s) => s.len);
+    if (checkRatio(runs)) {
+      const total = runs.reduce((a, b) => a + b, 0);
+      const centerX = window[0].start + total / 2;
+      candidates.push({ x: centerX, y, moduleSize: total / 7 });
+    }
+  }
+  return candidates;
+}
+function verifyVertical(bin, width, height, x, yGuess) {
+  const cx = Math.round(x);
+  if (cx < 0 || cx >= width) return null;
+  const segs = runLengthEncode((y) => bin[y * width + cx], height);
+  for (let i = 0; i + 4 < segs.length; i++) {
+    if (segs[i].color !== 1) continue;
+    const window = segs.slice(i, i + 5);
+    const runs5 = window.map((s) => s.len);
+    const mid = window[2];
+    if (mid.start <= yGuess && yGuess < mid.start + mid.len && checkRatio(runs5)) {
+      return mid.start + mid.len / 2;
+    }
+  }
+  return null;
+}
+function findFinderPatterns(bin, width, height) {
+  const raw = [];
+  for (let y = 0; y < height; y += 2) {
+    const rowCandidates = findFinderCandidatesInRow(bin, width, y, y * width);
+    for (const cand of rowCandidates) {
+      const vy = verifyVertical(bin, width, height, cand.x, y);
+      if (vy !== null) raw.push({ x: cand.x, y: vy, moduleSize: cand.moduleSize });
+    }
+  }
+  const clusters = [];
+  for (const pt of raw) {
+    let found = false;
+    for (const cl of clusters) {
+      const d = Math.hypot(cl.x / cl.n - pt.x, cl.y / cl.n - pt.y);
+      if (d < (cl.moduleSize / cl.n) * 3 + 4) {
+        cl.x += pt.x;
+        cl.y += pt.y;
+        cl.moduleSize += pt.moduleSize;
+        cl.n++;
+        found = true;
+        break;
+      }
+    }
+    if (!found) clusters.push({ x: pt.x, y: pt.y, moduleSize: pt.moduleSize, n: 1 });
+  }
+  return clusters
+    .map((c) => ({ x: c.x / c.n, y: c.y / c.n, moduleSize: c.moduleSize / c.n, votes: c.n }))
+    .sort((a, b) => b.votes - a.votes);
+}
+function pickBestTriple(points) {
+  if (points.length < 3) return null;
+  const top = points.slice(0, Math.min(points.length, 8));
+  let best = null;
+  let bestScore = Infinity;
+  for (let i = 0; i < top.length; i++) {
+    for (let j = i + 1; j < top.length; j++) {
+      for (let k = j + 1; k < top.length; k++) {
+        const pts = [top[i], top[j], top[k]];
+        const avgModule = (pts[0].moduleSize + pts[1].moduleSize + pts[2].moduleSize) / 3;
+        const sizeVariance =
+          Math.abs(pts[0].moduleSize - avgModule) + Math.abs(pts[1].moduleSize - avgModule) + Math.abs(pts[2].moduleSize - avgModule);
+        const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+        const dab = d(pts[0], pts[1]),
+          dbc = d(pts[1], pts[2]),
+          dac = d(pts[0], pts[2]);
+        const sides = [dab, dbc, dac].sort((x, y) => x - y);
+        const legRatio = sides[1] / sides[0];
+        const hypRatio = sides[2] / (sides[0] * Math.SQRT2);
+        const score = Math.abs(legRatio - 1) + Math.abs(hypRatio - 1) + sizeVariance / avgModule;
+        if (score < bestScore) {
+          bestScore = score;
+          best = pts;
+        }
+      }
+    }
+  }
+  return bestScore < 0.6 ? best : null;
+}
+function identifyCorners(points) {
+  const [a, b, c] = points;
+  const dist2 = (p, q) => (p.x - q.x) ** 2 + (p.y - q.y) ** 2;
+  const dab = dist2(a, b),
+    dbc = dist2(b, c),
+    dac = dist2(a, c);
+  let topLeft, p1, p2;
+  if (dab >= dbc && dab >= dac) {
+    topLeft = c;
+    p1 = a;
+    p2 = b;
+  } else if (dbc >= dab && dbc >= dac) {
+    topLeft = a;
+    p1 = b;
+    p2 = c;
+  } else {
+    topLeft = b;
+    p1 = a;
+    p2 = c;
+  }
+  const cross = (p1.x - topLeft.x) * (p2.y - topLeft.y) - (p1.y - topLeft.y) * (p2.x - topLeft.x);
+  let topRight, bottomLeft;
+  if (cross > 0) {
+    topRight = p1;
+    bottomLeft = p2;
+  } else {
+    topRight = p2;
+    bottomLeft = p1;
+  }
+  return { topLeft, topRight, bottomLeft };
+}
+
+// ---------- perspective sampling ----------
+function computeHomographyDecode(src, dst) {
+  // src, dst: 4 points each {x,y}. Solve 8x8 linear system for projective transform.
+  const A = [];
+  const B = [];
+  for (let i = 0; i < 4; i++) {
+    const { x: X, y: Y } = src[i];
+    const { x: xp, y: yp } = dst[i];
+    A.push([X, Y, 1, 0, 0, 0, -X * xp, -Y * xp]);
+    B.push(xp);
+    A.push([0, 0, 0, X, Y, 1, -X * yp, -Y * yp]);
+    B.push(yp);
+  }
+  const h = solveLinearSystemDecode(A, B);
+  if (!h) return null;
+  return [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1];
+}
+function solveLinearSystemDecode(A, B) {
+  const n = A.length;
+  const M = A.map((row, i) => [...row, B[i]]);
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let row = col + 1; row < n; row++) {
+      if (Math.abs(M[row][col]) > Math.abs(M[pivot][col])) pivot = row;
+    }
+    if (Math.abs(M[pivot][col]) < 1e-12) return null;
+    [M[col], M[pivot]] = [M[pivot], M[col]];
+    for (let row = 0; row < n; row++) {
+      if (row === col) continue;
+      const factor = M[row][col] / M[col][col];
+      for (let c = col; c <= n; c++) M[row][c] -= factor * M[col][c];
+    }
+  }
+  return M.map((row, i) => row[n] / row[i]);
+}
+function applyHomography(h, x, y) {
+  const denom = h[6] * x + h[7] * y + h[8];
+  return { x: (h[0] * x + h[1] * y + h[2]) / denom, y: (h[3] * x + h[4] * y + h[5]) / denom };
+}
+
+// Ideal alignment-pattern binary mask: 5x5, dark border ring, light ring, dark center.
+const ALIGNMENT_IDEAL = [
+  [1, 1, 1, 1, 1],
+  [1, 0, 0, 0, 1],
+  [1, 0, 1, 0, 1],
+  [1, 0, 0, 0, 1],
+  [1, 1, 1, 1, 1],
+];
+// Scores how well the image matches the alignment pattern if its center were at the
+// given MODULE-space coordinate, by sampling through the (possibly imprecise) current
+// homography estimate `h`. Naturally follows local perspective foreshortening near the
+// search point, unlike a fixed-radius pixel search — and unlike 1D run-length scanning,
+// isn't confused by unrelated dark data modules sitting just outside the pattern.
+function scoreAlignmentAt(bin, width, height, h, col, row) {
+  let matches = 0;
+  for (let dr = -2; dr <= 2; dr++) {
+    for (let dc = -2; dc <= 2; dc++) {
+      const p = applyHomography(h, col + dc, row + dr);
+      const px = Math.round(p.x),
+        py = Math.round(p.y);
+      if (px < 0 || px >= width || py < 0 || py >= height) return -1;
+      const val = bin[py * width + px] ? 1 : 0;
+      if (val === ALIGNMENT_IDEAL[dr + 2][dc + 2]) matches++;
+    }
+  }
+  return matches / 25;
+}
+// Searches nearby module-space offsets (via the preliminary homography `h`) to explore
+// candidate PIXEL locations, looking for the true alignment-pattern center. The
+// alignment pattern's module-space coordinate is fixed by the QR spec (srcCol, srcRow,
+// unchanged) — only its pixel location is uncertain (because `h` is only an affine
+// parallelogram estimate that breaks under real keystone perspective). The offsets are
+// purely a way to walk to nearby pixel candidates through h's local scale/shear; the
+// winning PIXEL is then paired with the fixed true module coordinate, not the offset one.
+function findAlignmentPattern(bin, width, height, h, srcCol, srcRow) {
+  let best = null;
+  let bestScore = 0;
+  const range = 5,
+    step = 0.5;
+  for (let dr = -range; dr <= range; dr += step) {
+    for (let dc = -range; dc <= range; dc += step) {
+      const col = srcCol + dc,
+        row = srcRow + dr;
+      const score = scoreAlignmentAt(bin, width, height, h, col, row);
+      if (score > bestScore) {
+        bestScore = score;
+        best = { col, row };
+      }
+    }
+  }
+  if (!best || bestScore < 0.84) return null;
+  const dstPoint = applyHomography(h, best.col, best.row);
+  return { src: { x: srcCol, y: srcRow }, dst: dstPoint };
+}
+function sampleMatrixWithPoints(bin, width, height, srcPts, dstPts, size) {
+  const h = computeHomographyDecode(srcPts, dstPts);
+  if (!h) return null;
+  const matrix = [];
+  for (let row = 0; row < size; row++) {
+    const rowArr = [];
+    for (let col = 0; col < size; col++) {
+      const p = applyHomography(h, col + 0.5, row + 0.5);
+      const px = Math.round(p.x),
+        py = Math.round(p.y);
+      if (px < 0 || px >= width || py < 0 || py >= height) {
+        rowArr.push(false);
+      } else {
+        rowArr.push(bin[py * width + px] === 1);
+      }
+    }
+    matrix.push(rowArr);
+  }
+  return matrix;
+}
+// Builds candidate sampled matrices to try, ordered most-to-least likely correct. The
+// alignment-pattern search is a heuristic (pixel-similarity score, not a geometric
+// certainty) — it's right most of the time under real perspective distortion, but can
+// occasionally lock onto a false match. Rather than trust it blindly, we offer it as a
+// candidate and let the caller's full decode pipeline (format info + Reed-Solomon +
+// mode check) be the actual arbiter of correctness, falling back to the affine-only
+// parallelogram estimate (exact for pure rotation/scale) if the alignment guess is wrong.
+function sampleMatrixCandidates(bin, width, height, corners, size) {
+  const version = (size - 17) / 4;
+  const srcTL = { x: 3.5, y: 3.5 };
+  const srcTR = { x: size - 3.5, y: 3.5 };
+  const srcBL = { x: 3.5, y: size - 3.5 };
+  const dstTL = corners.topLeft;
+  const dstTR = corners.topRight;
+  const dstBL = corners.bottomLeft;
+
+  const src4Parallelogram = { x: size - 3.5, y: size - 3.5 };
+  const dst4Parallelogram = {
+    x: dstTR.x + dstBL.x - dstTL.x,
+    y: dstTR.y + dstBL.y - dstTL.y,
+  };
+
+  const candidates = [];
+  if (version >= 2) {
+    const prelimH = computeHomographyDecode(
+      [srcTL, srcTR, srcBL, src4Parallelogram],
+      [dstTL, dstTR, dstBL, dst4Parallelogram]
+    );
+    if (prelimH) {
+      const srcAlign = { x: size - 6.5, y: size - 6.5 }; // alignment pattern center (module space, fixed by spec)
+      const found = findAlignmentPattern(bin, width, height, prelimH, srcAlign.x, srcAlign.y);
+      if (found) {
+        candidates.push(
+          sampleMatrixWithPoints(bin, width, height, [srcTL, srcTR, srcBL, found.src], [dstTL, dstTR, dstBL, found.dst], size)
+        );
+      }
+    }
+  }
+  candidates.push(
+    sampleMatrixWithPoints(bin, width, height, [srcTL, srcTR, srcBL, src4Parallelogram], [dstTL, dstTR, dstBL, dst4Parallelogram], size)
+  );
+  return candidates.filter(Boolean);
+}
+
+// ---------- main decode entry point ----------
+function decodeQRFromImageData(data, width, height) {
+  const gray = toGrayscale(data, width, height);
+  const blockSize = Math.max(16, Math.round(Math.min(width, height) / 20));
+  for (const bin of [
+    binarizeAdaptive(gray, width, height, blockSize),
+    (() => {
+      const t = otsuThreshold(gray);
+      const b = new Uint8Array(width * height);
+      for (let i = 0; i < gray.length; i++) b[i] = gray[i] <= t ? 1 : 0;
+      return b;
+    })(),
+  ]) {
+    const result = tryDecodeBinarized(bin, width, height);
+    if (result) return result;
+  }
+  return null;
+}
+// Attempts a complete decode (format info -> unmask -> codewords -> RS correction ->
+// byte-mode parse) at one candidate grid size. Format-info alone (a 15-bit BCH code)
+// is too weak a filter when the grid size is wrong — a mis-sized sample can coincidentally
+// land within its 3-bit correction radius. Reed-Solomon decoding across the *whole*
+// codeword set plus the mode-indicator check are much stronger, so we only accept a size
+// once the entire pipeline succeeds, not just the format-info step.
+function attemptDecodeAtSize(bin, width, height, corners, size) {
+  const candidates = sampleMatrixCandidates(bin, width, height, corners, size);
+  for (const matrix of candidates) {
+    const result = attemptDecodeMatrix(matrix, size);
+    if (result) return result;
+  }
+  return null;
+}
+function attemptDecodeMatrix(matrix, size) {
+  const version = (size - 17) / 4;
+  const copyA = readFormatCopyA(matrix, size);
+  const copyB = readFormatCopyB(matrix, size);
+  const decA = decodeFormatBits(copyA);
+  const decB = decodeFormatBits(copyB);
+  let fmt = null;
+  if (decA && decB) fmt = decA.distance <= decB.distance ? decA : decB;
+  else fmt = decA || decB;
+  if (!fmt) return null;
+
+  const isFunc = buildFunctionMask(size, version);
+  const maskFn = MASK_FUNCS[fmt.mask];
+  const unmasked = [];
+  for (let r = 0; r < size; r++) {
+    const row = [];
+    for (let c = 0; c < size; c++) {
+      let v = matrix[r][c];
+      if (!isFunc[r][c] && maskFn(r, c)) v = !v;
+      row.push(v);
+    }
+    unmasked.push(row);
+  }
+
+  const bits = readDataBits(unmasked, isFunc, size);
+  const info = VERSION_INFO_L[version];
+  const totalCodewords = info.data + info.ec;
+  if (bits.length < totalCodewords * 8) return null;
+  const codewords = [];
+  for (let i = 0; i < totalCodewords; i++) {
+    let byte = 0;
+    for (let j = 0; j < 8; j++) byte = (byte << 1) | (bits[i * 8 + j] || 0);
+    codewords.push(byte);
+  }
+
+  const rsResult = rsDecode(codewords, info.ec);
+  if (!rsResult) return null;
+  const dataCodewords = rsResult.codewords.slice(0, info.data);
+
+  let bitPos = 0;
+  function readBits(n) {
+    let v = 0;
+    for (let i = 0; i < n; i++) {
+      const byteIdx = bitPos >>> 3;
+      const bitIdx = 7 - (bitPos & 7);
+      const bit = byteIdx < dataCodewords.length ? (dataCodewords[byteIdx] >>> bitIdx) & 1 : 0;
+      v = (v << 1) | bit;
+      bitPos++;
+    }
+    return v;
+  }
+  const mode = readBits(4);
+  if (mode !== 0b0100) return null; // only byte mode supported (matches our encoder)
+  const count = readBits(8);
+  if (count > info.data) return null;
+  let text = "";
+  for (let i = 0; i < count; i++) {
+    text += String.fromCharCode(readBits(8));
+  }
+  return { text, version, mask: fmt.mask, errorsCorrected: rsResult.errors };
+}
+function tryDecodeBinarized(bin, width, height) {
+  const finderPoints = findFinderPatterns(bin, width, height);
+  const triple = pickBestTriple(finderPoints);
+  if (!triple) return null;
+  const corners = identifyCorners(triple);
+  const avgModuleSize = (triple[0].moduleSize + triple[1].moduleSize + triple[2].moduleSize) / 3;
+  const dTopSide = Math.hypot(corners.topRight.x - corners.topLeft.x, corners.topRight.y - corners.topLeft.y);
+  const sizeEstimate = Math.round(dTopSide / avgModuleSize) + 7;
+  const validSizes = [21, 25, 29, 33, 37];
+  // The scanline-derived module size gets distorted by rotation, so it's only a starting
+  // guess — try candidate sizes closest-first, fully decoding each (see attemptDecodeAtSize).
+  const candidateSizes = validSizes.slice().sort((a, b) => Math.abs(a - sizeEstimate) - Math.abs(b - sizeEstimate));
+
+  for (const candidateSize of candidateSizes) {
+    const result = attemptDecodeAtSize(bin, width, height, corners, candidateSize);
+    if (result) return result;
+  }
+  return null;
+}
+
 /* ========================================================================= */
 
 function normalizeSaudiPhone(input) {
@@ -1838,8 +2571,10 @@ function parsePassCode(raw) {
 
 function CameraScannerModal({ guests, onClose, onResult }) {
   const videoRef = useRef(null);
+  const canvasRef = useRef(null);
   const streamRef = useRef(null);
   const rafRef = useRef(null);
+  const timeoutRef = useRef(null);
   const [state, setState] = useState("requesting"); // requesting | active | error
   const [errorType, setErrorType] = useState(null); // unsupported | permission | generic
 
@@ -1847,11 +2582,6 @@ function CameraScannerModal({ guests, onClose, onResult }) {
     let cancelled = false;
 
     async function start() {
-      if (!("BarcodeDetector" in window)) {
-        setErrorType("unsupported");
-        setState("error");
-        return;
-      }
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         setErrorType("unsupported");
         setState("error");
@@ -1869,26 +2599,69 @@ function CameraScannerModal({ guests, onClose, onResult }) {
           await videoRef.current.play();
         }
         setState("active");
-        const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
 
-        const tick = async () => {
-          if (cancelled || !videoRef.current) return;
-          try {
-            const codes = await detector.detect(videoRef.current);
-            if (codes && codes.length > 0) {
-              const passCode = parsePassCode(codes[0].rawValue);
-              const guest = passCode
-                ? guests.find((g) => normalizePassCode(g.passCode) === normalizePassCode(passCode))
-                : null;
-              onResult({ passCode, guest, raw: codes[0].rawValue });
-              return;
+        function handleCode(rawValue) {
+          const passCode = parsePassCode(rawValue);
+          const guest = passCode ? guests.find((g) => normalizePassCode(g.passCode) === normalizePassCode(passCode)) : null;
+          onResult({ passCode, guest, raw: rawValue });
+        }
+
+        // Fast path: native BarcodeDetector, where available (most Android Chrome).
+        if ("BarcodeDetector" in window) {
+          const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+          const tick = async () => {
+            if (cancelled || !videoRef.current) return;
+            try {
+              const codes = await detector.detect(videoRef.current);
+              if (codes && codes.length > 0) {
+                handleCode(codes[0].rawValue);
+                return;
+              }
+            } catch (e) {
+              /* transient detection errors are ignored, polling continues */
             }
-          } catch (e) {
-            /* transient detection errors are ignored, polling continues */
-          }
+            rafRef.current = requestAnimationFrame(tick);
+          };
           rafRef.current = requestAnimationFrame(tick);
+          return;
+        }
+
+        // Fallback: pure-JS decoder (covers Safari/iPhone and other browsers without
+        // BarcodeDetector). Throttled — the full decode pipeline (finder search across
+        // two binarizations, geometric homography, Reed-Solomon) is too heavy to run on
+        // every animation frame on lower-end phones.
+        const canvas = canvasRef.current || document.createElement("canvas");
+        canvasRef.current = canvas;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        const MAX_DIM = 480;
+        const tickFallback = () => {
+          if (cancelled || !videoRef.current) return;
+          const video = videoRef.current;
+          const vw = video.videoWidth,
+            vh = video.videoHeight;
+          if (vw && vh) {
+            const scale = Math.min(1, MAX_DIM / Math.max(vw, vh));
+            const cw = Math.max(1, Math.round(vw * scale));
+            const ch = Math.max(1, Math.round(vh * scale));
+            if (canvas.width !== cw || canvas.height !== ch) {
+              canvas.width = cw;
+              canvas.height = ch;
+            }
+            ctx.drawImage(video, 0, 0, cw, ch);
+            try {
+              const imageData = ctx.getImageData(0, 0, cw, ch);
+              const result = decodeQRFromImageData(imageData.data, cw, ch);
+              if (result) {
+                handleCode(result.text);
+                return;
+              }
+            } catch (e) {
+              /* transient decode errors are ignored, polling continues */
+            }
+          }
+          timeoutRef.current = setTimeout(tickFallback, 200);
         };
-        rafRef.current = requestAnimationFrame(tick);
+        tickFallback();
       } catch (e) {
         if (cancelled) return;
         if (e && (e.name === "NotAllowedError" || e.name === "PermissionDeniedError")) setErrorType("permission");
@@ -1901,6 +2674,7 @@ function CameraScannerModal({ guests, onClose, onResult }) {
     return () => {
       cancelled = true;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
