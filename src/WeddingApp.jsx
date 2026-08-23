@@ -2361,6 +2361,13 @@ function GuestListTab({ guests, setGuests }) {
   const [formGuest, setFormGuest] = useState(undefined); // undefined=closed, null=new, object=edit
   const [deleteGuest, setDeleteGuest] = useState(null);
   const [statusFilter, setStatusFilter] = useState(null); // null|confirmed|declined|pending
+  const [previewUrl, setPreviewUrl] = useState(null);
+
+  function downloadCard(guest) {
+    const canvas = document.createElement("canvas");
+    drawExtraCardToCanvas(canvas, guest, guest.id);
+    setPreviewUrl(canvas.toDataURL("image/png"));
+  }
 
   const regularGuests = guests.filter((g) => !g.isExtraCard);
 
@@ -2530,6 +2537,9 @@ function GuestListTab({ guests, setGuests }) {
                   </td>
                   <td className="px-3 py-2.5">
                     <div className="flex gap-1.5">
+                      <button onClick={() => downloadCard(g)} className="p-1.5 rounded-lg" style={{ color: COLORS.orange }} title="تحميل كرت الدعوة">
+                        <Download size={15} />
+                      </button>
                       <button onClick={() => setFormGuest(g)} className="p-1.5 rounded-lg" style={{ color: COLORS.olive }}>
                         <Pencil size={15} />
                       </button>
@@ -2565,6 +2575,7 @@ function GuestListTab({ guests, setGuests }) {
           }}
         />
       )}
+      {previewUrl && <ImagePreviewModal dataUrl={previewUrl} onClose={() => setPreviewUrl(null)} />}
     </div>
   );
 }
