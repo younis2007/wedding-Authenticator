@@ -2377,6 +2377,9 @@ function GuestListTab({ guests, setGuests }) {
     declined: regularGuests.filter((g) => g.status === "declined").length,
     pending: regularGuests.filter((g) => g.status === "pending").length,
     checkedIn: regularGuests.filter((g) => g.checkedIn).length,
+    confirmedHeadcount: regularGuests
+      .filter((g) => g.status === "confirmed")
+      .reduce((sum, g) => sum + 1 + (g.companions || 0) + (g.children || 0), 0),
   };
 
   const statusFilterLabel = { confirmed: "المؤكدين", declined: "المعتذرين", pending: "بانتظار الرد" }[statusFilter];
@@ -2408,7 +2411,7 @@ function GuestListTab({ guests, setGuests }) {
 
   return (
     <div>
-      <div className="grid grid-cols-5 gap-2 mb-5">
+      <div className="grid grid-cols-3 gap-2 mb-5">
         <StatCard label="الإجمالي" value={stats.total} />
         <StatCard
           label="مؤكدين"
@@ -2429,6 +2432,7 @@ function GuestListTab({ guests, setGuests }) {
           onClick={() => toggleStatusFilter("pending")}
         />
         <StatCard label="تسجيل دخول" value={stats.checkedIn} />
+        <StatCard label="إجمالي الحضور (مؤكدين)" value={stats.confirmedHeadcount} />
       </div>
 
       <StatusBreakdownChart confirmed={stats.confirmed} declined={stats.declined} pending={stats.pending} />
