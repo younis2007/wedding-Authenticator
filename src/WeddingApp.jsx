@@ -1364,17 +1364,36 @@ function CornerControls({ onAdmin, onScan }) {
   );
 }
 
+const STATUS_MAP = {
+  pending: { label: "بانتظار الرد", bg: COLORS.mutedGold, text: COLORS.textDark },
+  confirmed: { label: "مؤكد", bg: COLORS.olive, text: "#fff" },
+  declined: { label: "معتذر", bg: COLORS.error, text: "#fff" },
+};
+
 function StatusPill({ status }) {
-  const map = {
-    pending: { label: "بانتظار الرد", bg: COLORS.mutedGold, text: COLORS.textDark },
-    confirmed: { label: "مؤكد", bg: COLORS.olive, text: "#fff" },
-    declined: { label: "معتذر", bg: COLORS.error, text: "#fff" },
-  };
-  const s = map[status] || map.pending;
+  const s = STATUS_MAP[status] || STATUS_MAP.pending;
   return (
     <span className="inline-block rounded-full px-2.5 py-1 text-xs font-bold" style={{ backgroundColor: s.bg, color: s.text }}>
       {s.label}
     </span>
+  );
+}
+
+function StatusSelect({ value, onChange }) {
+  const s = STATUS_MAP[value] || STATUS_MAP.pending;
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="rounded-full pr-2.5 pl-6 py-1 text-xs font-bold outline-none border-0 cursor-pointer"
+      style={{ backgroundColor: s.bg, color: s.text }}
+    >
+      {Object.entries(STATUS_MAP).map(([key, m]) => (
+        <option key={key} value={key}>
+          {m.label}
+        </option>
+      ))}
+    </select>
   );
 }
 
@@ -2409,6 +2428,12 @@ function GuestListTab({ guests, setGuests }) {
     setGuests((prev) => prev.map((g) => (g.id === id ? { ...g, checkedIn: !g.checkedIn } : g)));
   }
 
+  function updateStatus(id, status) {
+    setGuests((prev) =>
+      prev.map((g) => (g.id === id ? { ...g, status, checkedIn: status === "confirmed" ? g.checkedIn : false } : g))
+    );
+  }
+
   return (
     <div>
       <div className="grid grid-cols-3 gap-2 mb-5">
@@ -2521,7 +2546,7 @@ function GuestListTab({ guests, setGuests }) {
                     {g.children}
                   </td>
                   <td className="px-3 py-2.5">
-                    <StatusPill status={g.status} />
+                    <StatusSelect value={g.status} onChange={(status) => updateStatus(g.id, status)} />
                   </td>
                   <td className="px-3 py-2.5">
                     <PhonePolicyPill value={g.phonePolicy} />
